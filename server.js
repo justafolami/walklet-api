@@ -5,6 +5,7 @@ import bcrypt from 'bcryptjs';
 import { z } from 'zod';
 import { supabase } from './db.js';
 import { authMiddleware, createToken } from './auth.js';
+import { createAndEncryptWallet } from './wallet.js';
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -28,6 +29,7 @@ function mapUserRow(row) {
   return {
     id: row.id,
     email: row.email,
+    username: row.username ?? null,
     age: row.age ?? null,
     weightKg:
       row.weight_kg !== null && row.weight_kg !== undefined
@@ -39,20 +41,28 @@ function mapUserRow(row) {
   };
 }
 
+// Schemas
 const signupSchema = z.object({
-  email: z.string().email(),
+  email: z.string().trim().email(),
   password: z.string().min(8),
-  age: z.coerce.number().int().min(1).max(120).optional().nullable(),
-  weightKg: z.coerce.number().min(1).max(1000).optional().nullable(),
-  heightCm: z.coerce.number().int().min(50).max(250).optional().nullable(),
 });
-
 const loginSchema = z.object({
-  email: z.string().trim().email(),  // trims before validating
+  email: z.string().trim().email(),
   password: z.string().min(8),
 });
+const profileSchema = z.object({
+  username: z
+    .string()
+    .trim()
+    .min(3, 'Username must be at least 3 characters')
+    .max(30, 'Username must be at most 30 characters')
+    .regex(/^[a-zA-Z0-9_]+$/, 'Only letters, numbers, and underscores are allowed'),
+  age: z.coerce.number().int().min(1).max(120).nullable().optional(),
+  weightKg: z.coerce.number().min(1).max(1000).nullable().optional(),
+  heightCm: z.coerce.number().int().min(50).max(250).nullable().optional(),
+});
 
-// Root route (friendly message)
+// Root + health
 app.get('/', (req, res) => {
   res.status(200).json({
     status: 'ok',
@@ -61,8 +71,6 @@ app.get('/', (req, res) => {
     time: new Date().toISOString(),
   });
 });
-
-// Health check
 app.get('/health', (req, res) => {
   res.status(200).json({
     status: 'ok',
@@ -71,30 +79,22 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Debug: issue a token to test auth flow (dev only)
+// Debug: token + protected
 app.get('/debug/token', (req, res) => {
   const email = String(req.query.email || 'test@example.com');
   const sub = String(req.query.sub || 'debug-user');
   try {
     const token = createToken({ id: sub, email });
-    return res.json({
-      token,
-      note: 'Use this token in Authorization header as: Bearer <token>',
-    });
+    return res.json({ token });
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }
 });
-
-// Debug: protected route (requires Bearer token)
 app.get('/debug/protected', authMiddleware, (req, res) => {
-  return res.json({
-    ok: true,
-    user: req.user, // { sub, email, iat, exp }
-  });
+  return res.json({ ok: true, user: req.user });
 });
 
-// Real: Signup route
+// Signup (email+password) + wallet generation
 app.post('/auth/signup', async (req, res) => {
   const parsed = signupSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -104,30 +104,22 @@ app.post('/auth/signup', async (req, res) => {
   }
 
   try {
-    const {
-      email,
-      password,
-      age = null,
-      weightKg = null,
-      heightCm = null,
-    } = parsed.data;
-
+    const { email, password } = parsed.data;
     const normalizedEmail = email.trim().toLowerCase();
-
-    // Hash password
     const passwordHash = await bcrypt.hash(password, 10);
 
-    // Insert user
+    // 1) Insert user
     const { data: user, error } = await supabase
       .from('users')
       .insert([
         {
           email: normalizedEmail,
           password_hash: passwordHash,
-          age,
-          weight_kg: weightKg,
-          height_cm: heightCm,
+          age: null,
+          weight_kg: null,
+          height_cm: null,
           wallet_address: null,
+          username: null,
         },
       ])
       .select('*')
@@ -145,16 +137,41 @@ app.post('/auth/signup', async (req, res) => {
       return res.status(500).json({ error: 'Signup failed' });
     }
 
-    // Create token
-    const token = createToken({ id: user.id, email: user.email });
-    return res.status(201).json({ token, user: mapUserRow(user) });
+    // 2) Create + store wallet (encrypted)
+    let updatedUser = user;
+    try {
+      const w = createAndEncryptWallet();
+      const { data: user2, error: uerr } = await supabase
+        .from('users')
+        .update({
+          wallet_address: w.address,
+          wallet_encrypted: w.ciphertext,
+          wallet_iv: w.iv,
+          wallet_tag: w.tag,
+          wallet_alg: w.alg,
+          wallet_created_at: new Date().toISOString(),
+        })
+        .eq('id', user.id)
+        .select('*')
+        .single();
+      if (uerr) {
+        console.error('Wallet update error:', uerr);
+      } else {
+        updatedUser = user2;
+      }
+    } catch (e) {
+      console.error('Wallet creation error:', e);
+    }
+
+    const token = createToken({ id: updatedUser.id, email: updatedUser.email });
+    return res.status(201).json({ token, user: mapUserRow(updatedUser) });
   } catch (e) {
     console.error('Signup error:', e);
     return res.status(500).json({ error: 'Signup failed' });
   }
 });
 
-// Real: Login route
+// Login
 app.post('/auth/login', async (req, res) => {
   const parsed = loginSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -190,7 +207,7 @@ app.post('/auth/login', async (req, res) => {
   }
 });
 
-// Real: Get current user (requires Bearer token)
+// Current user
 app.get('/me', authMiddleware, async (req, res) => {
   try {
     const { data: user, error } = await supabase
@@ -207,6 +224,75 @@ app.get('/me', authMiddleware, async (req, res) => {
   } catch (e) {
     console.error('Me route error:', e);
     return res.status(500).json({ error: 'Failed to fetch user' });
+  }
+});
+
+// Profile completion
+app.post('/profile', authMiddleware, async (req, res) => {
+  const parsed = profileSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res
+      .status(400)
+      .json({ error: 'Invalid input', details: parsed.error.flatten() });
+  }
+
+  const { username, age = null, weightKg = null, heightCm = null } = parsed.data;
+
+  try {
+    const updates = { username, age, weight_kg: weightKg, height_cm: heightCm };
+
+    const { data: user, error } = await supabase
+      .from('users')
+      .update(updates)
+      .eq('id', req.user.sub)
+      .select('*')
+      .single();
+
+    if (error) {
+      if (
+        error.code === '23505' ||
+        String(error.message).includes('users_username_lower_unique')
+      ) {
+        return res.status(409).json({ error: 'Username already taken' });
+      }
+      console.error('Profile update error:', error);
+      return res.status(500).json({ error: 'Profile update failed' });
+    }
+
+    return res.status(200).json({ user: mapUserRow(user) });
+  } catch (e) {
+    console.error('Profile error:', e);
+    return res.status(500).json({ error: 'Profile update failed' });
+  }
+});
+
+// Debug: manually create wallet for current user (dev only)
+app.post('/debug/create-wallet', authMiddleware, async (req, res) => {
+  try {
+    const w = createAndEncryptWallet();
+    const { data: user, error } = await supabase
+      .from('users')
+      .update({
+        wallet_address: w.address,
+        wallet_encrypted: w.ciphertext,
+        wallet_iv: w.iv,
+        wallet_tag: w.tag,
+        wallet_alg: w.alg,
+        wallet_created_at: new Date().toISOString(),
+      })
+      .eq('id', req.user.sub)
+      .select('*')
+      .single();
+
+    if (error) {
+      console.error('Debug wallet update error:', error);
+      return res.status(500).json({ error: 'Update failed', detail: error.message });
+    }
+
+    return res.json({ ok: true, address: user.wallet_address });
+  } catch (e) {
+    console.error('Debug wallet creation error:', e);
+    return res.status(500).json({ error: e.message || String(e) });
   }
 });
 
