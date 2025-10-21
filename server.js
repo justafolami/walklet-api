@@ -48,7 +48,7 @@ const signupSchema = z.object({
 });
 
 const loginSchema = z.object({
-  email: z.string().email(),
+  email: z.string().trim().email(),  // trims before validating
   password: z.string().min(8),
 });
 
@@ -187,6 +187,26 @@ app.post('/auth/login', async (req, res) => {
   } catch (e) {
     console.error('Login error:', e);
     return res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// Real: Get current user (requires Bearer token)
+app.get('/me', authMiddleware, async (req, res) => {
+  try {
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', req.user.sub)
+      .single();
+
+    if (error || !user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    return res.status(200).json({ user: mapUserRow(user) });
+  } catch (e) {
+    console.error('Me route error:', e);
+    return res.status(500).json({ error: 'Failed to fetch user' });
   }
 });
 
