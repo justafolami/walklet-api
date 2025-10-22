@@ -4,12 +4,21 @@ import cors from "cors";
 import bcrypt from "bcryptjs";
 import { z } from "zod";
 import { OAuth2Client } from "google-auth-library";
+import multer from "multer";
 import { supabase } from "./db.js";
 import { authMiddleware, createToken } from "./auth.js";
 import { createAndEncryptWallet } from "./wallet.js";
 
 const app = express();
 const PORT = process.env.PORT || 4000;
+const USDA_API_KEY = process.env.USDA_API_KEY || "";
+const usdaCache = new Map(); // simple in-memory cache for dev (name -> per100g or fdcId)
+
+// Multer (memory; we do not store images)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB cap for safety
+});
 
 const googleClientId = process.env.GOOGLE_CLIENT_ID || "";
 const googleClient = googleClientId ? new OAuth2Client(googleClientId) : null;
@@ -40,7 +49,25 @@ function mapUserRow(row) {
         : null,
     heightCm: row.height_cm ?? null,
     walletAddress: row.wallet_address ?? null,
+    dailyStepGoal:
+      row.daily_step_goal !== null && row.daily_step_goal !== undefined
+        ? Number(row.daily_step_goal)
+        : null,
     createdAt: row.created_at,
+  };
+}
+
+function localWindowUtc(offsetMin) {
+  // offsetMin: minutes east of UTC
+  const now = new Date();
+  const localNowMs = now.getTime() + offsetMin * 60000;
+  const localMidnight = new Date(localNowMs);
+  localMidnight.setUTCHours(0, 0, 0, 0);
+  const startUtcMs = localMidnight.getTime() - offsetMin * 60000;
+  const endUtcMs = startUtcMs + 24 * 60 * 60 * 1000;
+  return {
+    startUtc: new Date(startUtcMs).toISOString(),
+    endUtc: new Date(endUtcMs).toISOString(),
   };
 }
 
@@ -82,6 +109,13 @@ const walkSchema = z
     message: "endedAt must be after startedAt",
     path: ["endedAt"],
   });
+
+const mealAnalyzeSchema = z.object({
+  mealType: z.enum(["breakfast", "lunch", "dinner"]).optional(),
+});
+const tzSchema = z.object({
+  tzOffsetMin: z.coerce.number().optional().default(0), // minutes east of UTC
+});
 
 // Root + health
 app.get("/", (req, res) => {
@@ -246,7 +280,7 @@ app.post("/auth/login", async (req, res) => {
   }
 });
 
-// Google OAuth
+// Google OAuth (kept; you can ignore it for now)
 app.post("/auth/google", async (req, res) => {
   try {
     if (!googleClient) {
@@ -424,9 +458,39 @@ app.post("/profile", authMiddleware, async (req, res) => {
   }
 });
 
+// Local per-100g fallback nutrition (extend as needed)
+const NUTRITION_FALLBACK_PER_100G = {
+  apple: { calories: 52, protein_g: 0.3, carbs_g: 14, fat_g: 0.2 },
+  banana: { calories: 89, protein_g: 1.1, carbs_g: 23, fat_g: 0.3 },
+  orange: { calories: 47, protein_g: 0.9, carbs_g: 12, fat_g: 0.1 },
+  rice: { calories: 130, protein_g: 2.4, carbs_g: 28, fat_g: 0.3 },
+  "chicken breast": { calories: 165, protein_g: 31, carbs_g: 0, fat_g: 3.6 },
+  egg: { calories: 155, protein_g: 13, carbs_g: 1.1, fat_g: 11 },
+  beef: { calories: 250, protein_g: 26, carbs_g: 0, fat_g: 15 },
+  fish: { calories: 206, protein_g: 22, carbs_g: 0, fat_g: 12 },
+  yogurt: { calories: 59, protein_g: 10, carbs_g: 3.6, fat_g: 0.4 },
+  milk: { calories: 61, protein_g: 3.2, carbs_g: 4.8, fat_g: 3.3 },
+  bread: { calories: 265, protein_g: 9, carbs_g: 49, fat_g: 3.2 },
+  fries: { calories: 312, protein_g: 3.4, carbs_g: 41, fat_g: 15 },
+  burger: { calories: 254, protein_g: 17, carbs_g: 30, fat_g: 9 },
+  sandwich: { calories: 250, protein_g: 12, carbs_g: 28, fat_g: 9 },
+  pizza: { calories: 266, protein_g: 11, carbs_g: 33, fat_g: 10 },
+  donut: { calories: 452, protein_g: 4.9, carbs_g: 51, fat_g: 25 },
+  cake: { calories: 350, protein_g: 4.0, carbs_g: 60, fat_g: 10 },
+
+  // tableware/scene placeholders (ignored)
+  bowl: { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0 },
+  cup: { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0 },
+  fork: { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0 },
+  knife: { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0 },
+  spoon: { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0 },
+  "dining table": { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0 },
+};
+
+const DEFAULT_FALLBACK_KEY = "sandwich"; // generic fallback if name unknown
+
 /* ---------- Walk sessions ---------- */
 
-// Save a walk session (duplicate-safe)
 app.post("/walks", authMiddleware, async (req, res) => {
   const parsed = walkSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -454,7 +518,6 @@ app.post("/walks", authMiddleware, async (req, res) => {
 
     if (error) {
       if (String(error.code) === "23505") {
-        // Unique violation on (user_id, started_at) — treat as success
         return res.status(200).json({ ok: true, duplicate: true });
       }
       console.error("Insert walk error:", error);
@@ -468,23 +531,10 @@ app.post("/walks", authMiddleware, async (req, res) => {
   }
 });
 
-// Totals for "today" by local timezone (tzOffsetMin = minutes east of UTC)
 app.get("/walks/today", authMiddleware, async (req, res) => {
   try {
-    const offsetMin = Number(req.query.tzOffsetMin ?? 0);
-    const now = new Date();
-
-    // Shift now into local time and compute local midnight
-    const localNowMs = now.getTime() + offsetMin * 60 * 1000;
-    const localMidnight = new Date(localNowMs);
-    localMidnight.setUTCHours(0, 0, 0, 0);
-
-    // Convert window back to UTC
-    const startUtcMs = localMidnight.getTime() - offsetMin * 60 * 1000;
-    const endUtcMs = startUtcMs + 24 * 60 * 60 * 1000;
-
-    const startUtc = new Date(startUtcMs).toISOString();
-    const endUtc = new Date(endUtcMs).toISOString();
+    const { tzOffsetMin = 0 } = tzSchema.parse(req.query);
+    const { startUtc, endUtc } = localWindowUtc(tzOffsetMin);
 
     const { data: rows, error } = await supabase
       .from("walk_sessions")
@@ -509,7 +559,7 @@ app.get("/walks/today", authMiddleware, async (req, res) => {
       stepsToday,
       distanceM: Number(distanceM.toFixed(2)),
       sessionCount: rows?.length || 0,
-      window: { startUtc, endUtc, tzOffsetMin: offsetMin },
+      window: { startUtc, endUtc, tzOffsetMin },
     });
   } catch (e) {
     console.error("Today walks error:", e);
@@ -517,20 +567,10 @@ app.get("/walks/today", authMiddleware, async (req, res) => {
   }
 });
 
-// List today's sessions by local timezone
 app.get("/walks/list", authMiddleware, async (req, res) => {
   try {
-    const offsetMin = Number(req.query.tzOffsetMin ?? 0);
-    const now = new Date();
-
-    const shiftedNow = new Date(now.getTime() + offsetMin * 60 * 1000);
-    shiftedNow.setHours(0, 0, 0, 0);
-
-    const startUtcMs = shiftedNow.getTime() - offsetMin * 60 * 1000;
-    const endUtcMs = startUtcMs + 24 * 60 * 60 * 1000;
-
-    const startUtc = new Date(startUtcMs).toISOString();
-    const endUtc = new Date(endUtcMs).toISOString();
+    const { tzOffsetMin = 0 } = tzSchema.parse(req.query);
+    const { startUtc, endUtc } = localWindowUtc(tzOffsetMin);
 
     const { data: rows, error } = await supabase
       .from("walk_sessions")
@@ -557,7 +597,7 @@ app.get("/walks/list", authMiddleware, async (req, res) => {
     return res.status(200).json({
       items,
       count: items.length,
-      window: { startUtc, endUtc, tzOffsetMin: offsetMin },
+      window: { startUtc, endUtc, tzOffsetMin },
     });
   } catch (e) {
     console.error("Today walk list error:", e);
@@ -565,13 +605,638 @@ app.get("/walks/list", authMiddleware, async (req, res) => {
   }
 });
 
-// Optional alias
-app.get("/walk/list", authMiddleware, async (req, res) => {
-  req.url =
-    "/walks/list" +
-    (req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "");
-  return app._router.handle(req, res);
+/* ---------- Meal analysis ---------- */
+
+// Analyze a meal photo (limit 3 per local day). No image is stored.
+// Analyze a meal photo (limit 3 per local day). Live camera only.
+app.post(
+  "/meals/analyze",
+  authMiddleware,
+  upload.single("image"),
+  async (req, res) => {
+    try {
+      // Require live header
+      const liveHdr = String(req.headers["x-live-capture"] || "").trim();
+      if (liveHdr !== "1") {
+        return res.status(400).json({
+          error: "Live capture required (missing X-Live-Capture header)",
+        });
+      }
+
+      const { tzOffsetMin = 0 } = tzSchema.parse(req.query);
+      const { mealType } = mealAnalyzeSchema.parse(req.body);
+
+      if (!req.file) {
+        return res
+          .status(400)
+          .json({ error: "Missing image file (field: image)" });
+      }
+
+      // Freshness check (capturedAt within 15s)
+      const capStr = String(req.body.capturedAt || "");
+      const capAt = new Date(capStr);
+      if (!(capAt instanceof Date) || isNaN(capAt.getTime())) {
+        return res.status(400).json({ error: "Missing or invalid capturedAt" });
+      }
+      const ageMs = Math.abs(Date.now() - capAt.getTime());
+      if (ageMs > 15_000) {
+        return res
+          .status(400)
+          .json({ error: "Capture too old — recapture and try again" });
+      }
+
+      // Local-day window
+      const { startUtc, endUtc } = localWindowUtc(tzOffsetMin);
+
+      // Enforce 3/day and one-per-mealType (if provided)
+      const { data: todayRows, error: cntErr } = await supabase
+        .from("meal_analyses")
+        .select("id, meal_type, created_at")
+        .eq("user_id", req.user.sub)
+        .gte("created_at", startUtc)
+        .lt("created_at", endUtc);
+
+      if (cntErr) {
+        console.error("Count meals error:", cntErr);
+        return res.status(500).json({ error: "Failed to check daily limit" });
+      }
+
+      const usedCount = (todayRows || []).length;
+      if (usedCount >= 3) {
+        return res
+          .status(429)
+          .json({ error: "Daily limit reached (3 analyses per day)" });
+      }
+
+      if (mealType) {
+        const already = (todayRows || []).some((r) => r.meal_type === mealType);
+        if (already) {
+          return res
+            .status(409)
+            .json({ error: `You already analyzed ${mealType} today` });
+        }
+      }
+
+      // Stubbed "AI" analysis based on file length
+      const size = req.file.buffer.length || 1;
+      const seed = size % 97;
+      const protein = 10 + (seed % 31);
+      const carbs = 15 + ((seed * 3) % 46);
+      const fat = 5 + ((seed * 5) % 31);
+      const calories = protein * 4 + carbs * 4 + fat * 9;
+
+      let feedback = "Balanced meal.";
+      if (protein >= 25) feedback = "Good source of protein!";
+      if (fat >= 25 && protein < 20)
+        feedback = "High in fats — consider leaner options.";
+      if (carbs >= 45 && fat < 15)
+        feedback = "Carb-heavy — pair with protein for balance.";
+
+      // Save record (metadata only)
+      const { data: saved, error: insErr } = await supabase
+        .from("meal_analyses")
+        .insert([
+          {
+            user_id: req.user.sub,
+            meal_type: mealType || null,
+            calories,
+            protein_g: protein,
+            carbs_g: carbs,
+            fat_g: fat,
+          },
+        ])
+        .select("*")
+        .single();
+
+      if (insErr) {
+        console.error("Insert meal analysis error:", insErr);
+        return res.status(500).json({ error: "Failed to record analysis" });
+      }
+
+      const remaining = Math.max(0, 3 - (usedCount + 1));
+      const usedTypes = [
+        ...new Set((todayRows || []).map((r) => r.meal_type).filter(Boolean)),
+      ];
+      if (mealType && !usedTypes.includes(mealType)) usedTypes.push(mealType);
+
+      return res.status(200).json({
+        analysis: {
+          calories: Number(calories.toFixed(0)),
+          protein_g: protein,
+          carbs_g: carbs,
+          fat_g: fat,
+          feedback,
+        },
+        used: usedTypes,
+        remaining,
+      });
+    } catch (e) {
+      console.error("Analyze meal error:", e);
+      return res.status(500).json({ error: "Analysis failed" });
+    }
+  }
+);
+
+// Get today’s analyses summary (local day)
+app.get("/meals/today", authMiddleware, async (req, res) => {
+  try {
+    const { tzOffsetMin = 0 } = tzSchema.parse(req.query);
+    const { startUtc, endUtc } = localWindowUtc(tzOffsetMin);
+
+    const { data: rows, error } = await supabase
+      .from("meal_analyses")
+      .select("id, created_at, meal_type, calories, protein_g, carbs_g, fat_g")
+      .eq("user_id", req.user.sub)
+      .gte("created_at", startUtc)
+      .lt("created_at", endUtc)
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.error("Fetch meals today error:", error);
+      return res.status(500).json({ error: "Failed to fetch meal analyses" });
+    }
+
+    const items = (rows || []).map((r) => ({
+      id: r.id,
+      createdAt: r.created_at,
+      mealType: r.meal_type,
+      calories: r.calories ? Number(r.calories) : null,
+      protein_g: r.protein_g ? Number(r.protein_g) : null,
+      carbs_g: r.carbs_g ? Number(r.carbs_g) : null,
+      fat_g: r.fat_g ? Number(r.fat_g) : null,
+    }));
+
+    const used = [...new Set(items.map((i) => i.mealType).filter(Boolean))];
+    const remaining = Math.max(0, 3 - items.length);
+
+    return res
+      .status(200)
+      .json({ items, used, remaining, count: items.length });
+  } catch (e) {
+    console.error("Meals today error:", e);
+    return res.status(500).json({ error: "Failed to fetch meals today" });
+  }
 });
+
+// ---------- Dev tools: reset user data (walks, meals, profile, wallet) ----------
+const devResetSchema = z.object({
+  types: z
+    .array(z.enum(["walks", "meals", "profile", "wallet"]))
+    .default(["walks", "meals"]),
+  scope: z.enum(["today", "all"]).default("today"),
+  tzOffsetMin: z.coerce.number().optional().default(0), // minutes east of UTC
+});
+
+// Only allow when DEV_TOOLS=1
+function devGuard(req, res, next) {
+  if (process.env.DEV_TOOLS === "1") return next();
+  return res
+    .status(403)
+    .json({ error: "Dev tools disabled. Set DEV_TOOLS=1 in .env" });
+}
+
+app.post("/dev/reset", authMiddleware, devGuard, async (req, res) => {
+  try {
+    const { types, scope, tzOffsetMin } = devResetSchema.parse(req.body);
+
+    // Build time window (for "today" scope) using local timezone
+    let startUtc = null;
+    let endUtc = null;
+    if (scope === "today") {
+      const win = localWindowUtc(tzOffsetMin); // already in your server
+      startUtc = win.startUtc;
+      endUtc = win.endUtc;
+    }
+
+    const userId = req.user.sub;
+    const out = {
+      walksDeleted: 0,
+      mealsDeleted: 0,
+      profileCleared: false,
+      walletCleared: false,
+    };
+
+    // Helper: delete rows by IDs (allows us to count first)
+    async function deleteByIds(table, ids) {
+      if (!ids || ids.length === 0) return 0;
+      const { error } = await supabase.from(table).delete().in("id", ids);
+      if (error)
+        throw new Error(`Delete from ${table} failed: ${error.message}`);
+      return ids.length;
+    }
+
+    // Walks
+    if (types.includes("walks")) {
+      let walkQuery = supabase
+        .from("walk_sessions")
+        .select("id")
+        .eq("user_id", userId);
+      if (scope === "today") {
+        walkQuery = walkQuery
+          .gte("started_at", startUtc)
+          .lt("started_at", endUtc);
+      }
+      const { data: walkRows, error: walkErr } = await walkQuery;
+      if (walkErr) throw new Error(`Fetch walks failed: ${walkErr.message}`);
+      const walkIds = (walkRows || []).map((r) => r.id);
+      out.walksDeleted = await deleteByIds("walk_sessions", walkIds);
+    }
+
+    // Meals
+    if (types.includes("meals")) {
+      let mealQuery = supabase
+        .from("meal_analyses")
+        .select("id")
+        .eq("user_id", userId);
+      if (scope === "today") {
+        mealQuery = mealQuery
+          .gte("created_at", startUtc)
+          .lt("created_at", endUtc);
+      }
+      const { data: mealRows, error: mealErr } = await mealQuery;
+      if (mealErr) throw new Error(`Fetch meals failed: ${mealErr.message}`);
+      const mealIds = (mealRows || []).map((r) => r.id);
+      out.mealsDeleted = await deleteByIds("meal_analyses", mealIds);
+    }
+
+    // Profile (clear username, age, weight, height)
+    if (types.includes("profile")) {
+      const { error: pErr } = await supabase
+        .from("users")
+        .update({ username: null, age: null, weight_kg: null, height_cm: null })
+        .eq("id", userId);
+      if (pErr) throw new Error(`Profile clear failed: ${pErr.message}`);
+      out.profileCleared = true;
+    }
+
+    // Wallet (clear app-managed wallet fields) — note: minted on-chain tokens are unaffected
+    if (types.includes("wallet")) {
+      const { error: wErr } = await supabase
+        .from("users")
+        .update({
+          wallet_address: null,
+          wallet_encrypted: null,
+          wallet_iv: null,
+          wallet_tag: null,
+          wallet_alg: null,
+          wallet_created_at: null,
+        })
+        .eq("id", userId);
+      if (wErr) throw new Error(`Wallet clear failed: ${wErr.message}`);
+      out.walletCleared = true;
+    }
+
+    return res.status(200).json({ ok: true, scope, tzOffsetMin, ...out });
+  } catch (e) {
+    console.error("Dev reset error:", e);
+    return res.status(400).json({ error: e.message || "Reset failed" });
+  }
+});
+
+// Update daily step goal only
+const goalSchema = z.object({
+  dailyStepGoal: z.coerce.number().int().min(0).max(200000),
+});
+
+app.post("/profile/goal", authMiddleware, async (req, res) => {
+  const parsed = goalSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res
+      .status(400)
+      .json({ error: "Invalid input", details: parsed.error.flatten() });
+  }
+  try {
+    const { dailyStepGoal } = parsed.data;
+    const { data: user, error } = await supabase
+      .from("users")
+      .update({ daily_step_goal: dailyStepGoal })
+      .eq("id", req.user.sub)
+      .select("*")
+      .single();
+
+    if (error) {
+      console.error("Update goal error:", error);
+      return res.status(500).json({ error: "Failed to update goal" });
+    }
+
+    return res
+      .status(200)
+      .json({ ok: true, dailyStepGoal: Number(user.daily_step_goal) });
+  } catch (e) {
+    console.error("Goal route error:", e);
+    return res.status(500).json({ error: "Failed to update goal" });
+  }
+});
+
+// Dev info (frontend uses this to decide whether to show DevTools)
+app.get("/dev/info", (req, res) => {
+  const enabled = process.env.DEV_TOOLS === "1";
+  return res.status(200).json({ enabled });
+});
+
+// Delete a single walk session (dev-only)
+app.delete("/dev/walk/:id", authMiddleware, devGuard, async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    // ensure the walk belongs to the current user
+    const { data: rows, error: selErr } = await supabase
+      .from("walk_sessions")
+      .select("id, user_id")
+      .eq("id", id)
+      .limit(1);
+
+    if (selErr) {
+      console.error("Select walk err:", selErr);
+      return res.status(500).json({ error: "Lookup failed" });
+    }
+    if (!rows || rows.length === 0) {
+      return res.status(404).json({ error: "Walk not found" });
+    }
+    if (rows[0].user_id !== req.user.sub) {
+      return res.status(403).json({ error: "Not your walk" });
+    }
+
+    const { error: delErr } = await supabase
+      .from("walk_sessions")
+      .delete()
+      .eq("id", id);
+    if (delErr) {
+      console.error("Delete walk err:", delErr);
+      return res.status(500).json({ error: "Delete failed" });
+    }
+    return res.status(200).json({ ok: true, id });
+  } catch (e) {
+    console.error("Dev delete walk error:", e);
+    return res.status(500).json({ error: "Delete failed" });
+  }
+});
+
+// Compute macros from items [{ name, grams }] using USDA if possible, else fallback
+const usdaComputeSchema = z.object({
+  items: z.array(
+    z.object({
+      name: z.string().min(1),
+      grams: z.coerce.number().min(0).max(2000),
+    })
+  ),
+});
+
+app.post("/meals/compute", authMiddleware, async (req, res) => {
+  const parsed = usdaComputeSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res
+      .status(400)
+      .json({ error: "Invalid input", details: parsed.error.flatten() });
+  }
+
+  try {
+    let total = { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0 };
+    const breakdown = [];
+
+    for (const it of parsed.data.items) {
+      // Resolve per-100g (never throws; always returns something)
+      const { per100, source, meta } = await getPer100gForName(it.name);
+      const factor = (it.grams || 0) / 100;
+
+      const part = {
+        name: normalizeFoodName(meta?.description || it.name),
+        fdcId: meta?.fdcId || null,
+        dataType: meta?.dataType || null,
+        grams: it.grams,
+        calories: +(per100.calories * factor).toFixed(1),
+        protein_g: +(per100.protein_g * factor).toFixed(1),
+        carbs_g: +(per100.carbs_g * factor).toFixed(1),
+        fat_g: +(per100.fat_g * factor).toFixed(1),
+        source, // 'usda' or 'fallback'
+      };
+
+      breakdown.push(part);
+      total.calories += part.calories;
+      total.protein_g += part.protein_g;
+      total.carbs_g += part.carbs_g;
+      total.fat_g += part.fat_g;
+    }
+
+    total = {
+      calories: Math.round(total.calories),
+      protein_g: +total.protein_g.toFixed(1),
+      carbs_g: +total.carbs_g.toFixed(1),
+      fat_g: +total.fat_g.toFixed(1),
+    };
+
+    return res.status(200).json({ total, breakdown });
+  } catch (e) {
+    console.error("Compute meal (safe) error:", e);
+    // Even if something unexpected happens, fall back to a generic response
+    return res.status(200).json({
+      total: { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0 },
+      breakdown: [],
+      note: "Fell back to empty result due to an unexpected error.",
+    });
+  }
+});
+
+// ---- USDA helpers ----
+
+// Prefer FDC data types with standardized per-100g values first
+const PREFERRED_DATA_TYPES = [
+  "Survey (FNDDS)",
+  "SR Legacy",
+  "Foundation",
+  "Branded",
+];
+
+// Simple GET helper
+async function httpGetJson(url) {
+  const r = await fetch(url);
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    throw new Error(`USDA fetch failed (${r.status}): ${t}`);
+  }
+  return r.json();
+}
+
+// Search FDC for a food by name; returns best candidate
+async function usdaSearchFoodByName(name) {
+  const key = `search:${name.toLowerCase().trim()}`;
+  if (usdaCache.has(key)) return usdaCache.get(key);
+
+  const q = encodeURIComponent(name);
+  // Simpler query avoids edge cases with dataType filtering
+  const url = `https://api.nal.usda.gov/fdc/v1/foods/search?query=${q}&pageSize=5&api_key=${USDA_API_KEY}`;
+
+  const json = await httpGetJson(url);
+  const foods = Array.isArray(json.foods) ? json.foods : [];
+
+  foods.sort((a, b) => {
+    const ai = PREFERRED_DATA_TYPES.indexOf(a.dataType || "zzz");
+    const bi = PREFERRED_DATA_TYPES.indexOf(b.dataType || "zzz");
+    if (ai !== bi) return ai - bi;
+    const as = typeof a.score === "number" ? a.score : 0;
+    const bs = typeof b.score === "number" ? b.score : 0;
+    return bs - as;
+  });
+
+  const best = foods[0] || null;
+  usdaCache.set(key, best);
+  return best;
+}
+
+// Extract per-100g macros from a food details payload
+function extractPer100gFromFood(food) {
+  const list = Array.isArray(food.foodNutrients) ? food.foodNutrients : [];
+
+  // Handle either nutrientNumber on root or nutrient.number nested
+  const byNumber = (numStr) =>
+    list.find((n) => {
+      if (n.nutrientNumber && String(n.nutrientNumber) === String(numStr))
+        return true;
+      if (
+        n.nutrient &&
+        n.nutrient.number &&
+        String(n.nutrient.number) === String(numStr)
+      )
+        return true;
+      return false;
+    });
+
+  // 208 = kcal, 1008 = kJ (convert to kcal)
+  let kcal = 0;
+  const n208 = byNumber(208);
+  if (n208) {
+    const amt = Number(n208.amount || n208.value || 0);
+    const unit = (n208.unitName || n208.nutrient?.unitName || "").toLowerCase();
+    kcal = unit === "kj" ? Math.round(amt / 4.184) : amt;
+  } else {
+    const n1008 = byNumber(1008);
+    if (n1008) {
+      const amt = Number(n1008.amount || n1008.value || 0);
+      kcal = Math.round(amt / 4.184);
+    }
+  }
+
+  const protein = Number(byNumber(203)?.amount || byNumber(203)?.value || 0);
+  const carbs = Number(byNumber(205)?.amount || byNumber(205)?.value || 0);
+  const fat = Number(byNumber(204)?.amount || byNumber(204)?.value || 0);
+
+  // Branded items: prefer labelNutrients per serving converted to per-100g if serving size is grams
+  if ((food.dataType || "").toLowerCase() === "branded") {
+    const label = food.labelNutrients || {};
+    const servingSize = Number(food.servingSize || 0);
+    const unit = (food.servingSizeUnit || "").toLowerCase();
+    if (
+      servingSize > 0 &&
+      (unit === "g" || unit === "gram" || unit === "grams")
+    ) {
+      const factor = 100 / servingSize;
+      const lcal = Number(label.calories?.value || 0) * factor;
+      const lpro = Number(label.protein?.value || 0) * factor;
+      const lcar = Number(label.carbohydrates?.value || 0) * factor;
+      const lfat = Number(label.fat?.value || 0) * factor;
+
+      return {
+        calories: lcal || kcal,
+        protein_g: lpro || protein,
+        carbs_g: lcar || carbs,
+        fat_g: lfat || fat,
+      };
+    }
+  }
+
+  return {
+    calories: kcal,
+    protein_g: protein,
+    carbs_g: carbs,
+    fat_g: fat,
+  };
+}
+
+// Fetch food details and compute per-100g macros
+async function usdaPer100gByFdcId(fdcId) {
+  const key = `per100:${fdcId}`;
+  if (usdaCache.has(key)) return usdaCache.get(key);
+
+  // NOTE: singular "food" endpoint for details
+  const url = `https://api.nal.usda.gov/fdc/v1/food/${fdcId}?api_key=${USDA_API_KEY}`;
+  const json = await httpGetJson(url);
+  const per100 = extractPer100gFromFood(json);
+
+  usdaCache.set(key, per100);
+  return per100;
+}
+
+// Resolve a food name to per-100g macros (search + details)
+async function resolvePer100gByName(name) {
+  if (!USDA_API_KEY) throw new Error("USDA_API_KEY missing in .env");
+
+  const search = await usdaSearchFoodByName(name);
+  if (!search) throw new Error(`No USDA match for "${name}"`);
+  const per100 = await usdaPer100gByFdcId(search.fdcId);
+  return {
+    per100,
+    meta: {
+      fdcId: search.fdcId,
+      description: search.description,
+      dataType: search.dataType,
+    },
+  };
+}
+
+function normalizeFoodName(name) {
+  return String(name || "")
+    .toLowerCase()
+    .trim();
+}
+
+async function getPer100gForName(name) {
+  const n = normalizeFoodName(name);
+
+  // 1) Local fallback wins if we know it (fast)
+  if (NUTRITION_FALLBACK_PER_100G[n]) {
+    return {
+      per100: NUTRITION_FALLBACK_PER_100G[n],
+      source: "fallback",
+      meta: { description: n },
+    };
+  }
+
+  // 2) Try USDA if key exists
+  if (USDA_API_KEY) {
+    try {
+      const search = await usdaSearchFoodByName(n);
+      if (search && search.fdcId) {
+        const per100 = await usdaPer100gByFdcId(search.fdcId);
+        // If USDA returns non-sense (all zeros), fallback
+        const sum =
+          (per100.calories || 0) +
+          (per100.protein_g || 0) +
+          (per100.carbs_g || 0) +
+          (per100.fat_g || 0);
+        if (sum > 0) {
+          return {
+            per100,
+            source: "usda",
+            meta: {
+              fdcId: search.fdcId,
+              description: search.description,
+              dataType: search.dataType,
+            },
+          };
+        }
+      }
+    } catch {
+      // ignore and fallback
+    }
+  }
+
+  // 3) Final fallback: use DEFAULT_FALLBACK_KEY so we never crash
+  const fb = NUTRITION_FALLBACK_PER_100G[DEFAULT_FALLBACK_KEY];
+  return {
+    per100: fb,
+    source: "fallback",
+    meta: { description: DEFAULT_FALLBACK_KEY },
+  };
+}
 
 app.listen(PORT, () => {
   console.log(`✅ Walklet API listening on http://localhost:${PORT}`);
